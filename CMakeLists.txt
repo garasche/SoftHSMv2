@@ -122,6 +122,10 @@ enable_testing()
 # config.h include path
 include_directories(${CMAKE_BINARY_DIR})
 
+# MinGW: syslog shim for every subdirectory (MSVC builds get it per-subdir)
+if(WIN32 AND NOT MSVC)
+    include_directories(${CMAKE_SOURCE_DIR}/src/lib/win32)
+endif()
 add_subdirectory(src)
 
 # p11-kit
