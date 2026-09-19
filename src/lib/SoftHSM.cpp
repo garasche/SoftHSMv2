@@ -787,6 +787,10 @@ void SoftHSM::prepareSupportedMechanisms(std::map<std::string, CK_MECHANISM_TYPE
 	t["CKM_AES_KEY_WRAP"]		= CKM_AES_KEY_WRAP;
 #ifdef HAVE_AES_KEY_WRAP_PAD
 	t["CKM_AES_KEY_WRAP_PAD"]	= CKM_AES_KEY_WRAP_PAD;
+	// PKCS#11 v3.0 KWP id (0x210B); CMP: alias onto the same RFC 5649
+	// wrap SoftHSM already implements under CKM_AES_KEY_WRAP_PAD (0x210A) -
+	// see docs/design/pkcs11-softhsm-testing.md §5.8/§6.1 item 15.
+	t["CKM_AES_KEY_WRAP_KWP"]	= CKM_AES_KEY_WRAP_KWP;
 #endif
 	t["CKM_AES_ECB_ENCRYPT_DATA"]	= CKM_AES_ECB_ENCRYPT_DATA;
 	t["CKM_AES_CBC_ENCRYPT_DATA"]	= CKM_AES_CBC_ENCRYPT_DATA;
@@ -1187,6 +1191,15 @@ CK_RV SoftHSM::C_GetMechanismInfo(CK_SLOT_ID slotID, CK_MECHANISM_TYPE type, CK_
 			pInfo->ulMinKeySize = 1;
 			pInfo->ulMaxKeySize = 0x80000000;
 			pInfo->flags = CKF_WRAP | CKF_UNWRAP;
+			break;
+		case CKM_AES_KEY_WRAP_KWP:
+			pInfo->ulMinKeySize = 1;
+			pInfo->ulMaxKeySize = 0x80000000;
+			// CKF_ENCRYPT | CKF_DECRYPT are required for SunPKCS11 to
+			// enable this as a Cipher at all (docs/design/pkcs11-softhsm-testing.md
+			// §6.1 item 12); C_Encrypt/C_Decrypt are not otherwise used
+			// for this mechanism by this platform.
+			pInfo->flags = CKF_WRAP | CKF_UNWRAP | CKF_ENCRYPT | CKF_DECRYPT;
 			break;
 #endif
 		case CKM_RSA_AES_KEY_WRAP:
@@ -6341,11 +6354,18 @@ CK_RV SoftHSM::WrapKeySym
 			algo = SymAlgo::AES;
 			mode = SymWrap::AES_KEYWRAP_PAD;
 			break;
+		case CKM_AES_KEY_WRAP_KWP:
+			// Same RFC 5649 wrap as CKM_AES_KEY_WRAP_PAD, only the mechanism
+			// id differs (docs/design/pkcs11-softhsm-testing.md §5.8/§6.1
+			// item 15) - no new cryptographic code.
+			algo = SymAlgo::AES;
+			mode = SymWrap::AES_KEYWRAP_PAD;
+			break;
 #endif
 		case CKM_AES_CBC:
 			algo = SymAlgo::AES;
 			break;
-			
+
 		case CKM_AES_CBC_PAD:
 			blocksize = 16;
 			wrappedlen = RFC5652Pad(keydata, blocksize);
@@ -6649,6 +6669,17 @@ CK_RV SoftHSM::C_WrapKey
                             pMechanism->ulParameterLen != 0)
 				return CKR_ARGUMENTS_BAD;
 			break;
+#ifdef HAVE_AES_KEY_WRAP_PAD
+		case CKM_AES_KEY_WRAP_KWP:
+			// PKCS#11 v3.0 KWP (0x210B): SunPKCS11 always sends the RFC 5649
+			// default ICV as the mechanism parameter, or none
+			// (docs/design/pkcs11-softhsm-testing.md §5.8/§6.1 item 13).
+			if (pMechanism->pParameter != NULL_PTR &&
+			    (pMechanism->ulParameterLen != 4 ||
+			     memcmp(pMechanism->pParameter, "\xA6\x59\x59\xA6", 4) != 0))
+				return CKR_ARGUMENTS_BAD;
+			break;
+#endif
 		case CKM_RSA_PKCS_OAEP:
 			rv = MechParamCheckRSAPKCSOAEP(pMechanism);
 			if (rv != CKR_OK)
@@ -6691,7 +6722,7 @@ CK_RV SoftHSM::C_WrapKey
 	}
 
 	// Check wrapping key class and type
-	if ((pMechanism->mechanism == CKM_AES_KEY_WRAP || pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD) && wrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_SECRET_KEY)
+	if ((pMechanism->mechanism == CKM_AES_KEY_WRAP || pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD || pMechanism->mechanism == CKM_AES_KEY_WRAP_KWP) && wrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_SECRET_KEY)
 		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
 	if ((pMechanism->mechanism == CKM_RSA_PKCS || pMechanism->mechanism == CKM_RSA_PKCS_OAEP || pMechanism->mechanism == CKM_RSA_AES_KEY_WRAP) &&
 		wrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_PUBLIC_KEY)
@@ -6699,6 +6730,8 @@ CK_RV SoftHSM::C_WrapKey
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP && wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD && wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
+		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
+	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_KWP && wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_WRAPPING_KEY_TYPE_INCONSISTENT;
 	if ((pMechanism->mechanism == CKM_RSA_PKCS || pMechanism->mechanism == CKM_RSA_PKCS_OAEP || pMechanism->mechanism == CKM_RSA_AES_KEY_WRAP) &&
 		wrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_RSA)
@@ -6930,6 +6963,13 @@ CK_RV SoftHSM::UnwrapKeySym
 #endif
 #ifdef HAVE_AES_KEY_WRAP_PAD
 		case CKM_AES_KEY_WRAP_PAD:
+			algo = SymAlgo::AES;
+			mode = SymWrap::AES_KEYWRAP_PAD;
+			break;
+		case CKM_AES_KEY_WRAP_KWP:
+			// Same RFC 5649 wrap as CKM_AES_KEY_WRAP_PAD, only the mechanism
+			// id differs (docs/design/pkcs11-softhsm-testing.md section 5.8/6.1
+			// item 15) - no new cryptographic code.
 			algo = SymAlgo::AES;
 			mode = SymWrap::AES_KEYWRAP_PAD;
 			break;
@@ -7265,6 +7305,17 @@ CK_RV SoftHSM::C_UnwrapKey
                             pMechanism->ulParameterLen != 0)
 				return CKR_ARGUMENTS_BAD;
 			break;
+		case CKM_AES_KEY_WRAP_KWP:
+			if ((ulWrappedKeyLen < 16) || ((ulWrappedKeyLen % 8) != 0))
+				return CKR_WRAPPED_KEY_LEN_RANGE;
+			// PKCS#11 v3.0 KWP (0x210B): SunPKCS11 always sends the RFC 5649
+			// default ICV as the mechanism parameter, or none
+			// (docs/design/pkcs11-softhsm-testing.md section 5.8/6.1 item 13).
+			if (pMechanism->pParameter != NULL_PTR &&
+			    (pMechanism->ulParameterLen != 4 ||
+			     memcmp(pMechanism->pParameter, "\xA6\x59\x59\xA6", 4) != 0))
+				return CKR_ARGUMENTS_BAD;
+			break;
 #endif
 		case CKM_RSA_PKCS:
 			// Input length checks needs to be done later when unwrapping key is known
@@ -7320,11 +7371,13 @@ CK_RV SoftHSM::C_UnwrapKey
 	}
 
 	// Check unwrapping key class and type
-	if ((pMechanism->mechanism == CKM_AES_KEY_WRAP || pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD) && unwrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_SECRET_KEY)
+	if ((pMechanism->mechanism == CKM_AES_KEY_WRAP || pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD || pMechanism->mechanism == CKM_AES_KEY_WRAP_KWP) && unwrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_SECRET_KEY)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_PAD && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
+		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
+	if (pMechanism->mechanism == CKM_AES_KEY_WRAP_KWP && unwrapKey->getUnsignedLongValue(CKA_KEY_TYPE, CKK_VENDOR_DEFINED) != CKK_AES)
 		return CKR_UNWRAPPING_KEY_TYPE_INCONSISTENT;
 	if ((pMechanism->mechanism == CKM_RSA_PKCS || pMechanism->mechanism == CKM_RSA_PKCS_OAEP || pMechanism->mechanism == CKM_RSA_AES_KEY_WRAP) &&
 		unwrapKey->getUnsignedLongValue(CKA_CLASS, CKO_VENDOR_DEFINED) != CKO_PRIVATE_KEY)
